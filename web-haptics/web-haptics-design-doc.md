@@ -3,7 +3,7 @@
 ## This Document is Public
 
 *Authors: [akyereboah@microsoft.com](mailto:akyereboah@microsoft.com)*
-*July 2026*
+*August 2026*
 
 ---
 
