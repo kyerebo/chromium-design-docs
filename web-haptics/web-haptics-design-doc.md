@@ -35,14 +35,16 @@ Currently targeting Windows, planned for Mac, Linux, ChromeOS, WebKit, Android, 
 
 ### **Bug**
 
-531787872
+[531787872](https://issues.chromium.org/issues/531787872)
 
 ### **Code affected**
 
 Blink bindings & modules (`third_party/blink/renderer/modules/haptics/`),
-device service mojom & default backend (`services/device/`), browser-process
-Windows backend and interface binder (`content/browser/`), permissions-policy
-and runtime-flag registration.
+renderer-facing mojom (`third_party/blink/public/mojom/haptics/`), the
+browser-process `content::HapticsService` intermediary, Windows backend, and
+interface binder (`content/browser/`), permissions-policy and runtime-flag
+registration. (A device-service backend for non-Windows platforms is deferred, see
+[D5](#d5-device-service-backend-non-windows-platforms).)
 
 ---
 
@@ -57,9 +59,10 @@ current design work is in **imperative API**.
 ### D0. Background and end-to-end data flow
 
 `navigator.playHaptics(effect, intensity)` is a call that returns `undefined`.
-The renderer performs all policy gating, then forwards the request
-over a Mojo interface to a browser/device-service backend that talks to the
-platform haptics API.
+The renderer does an early, fast-path check, then forwards the request
+over a Mojo interface to `content::HapticsService`, a **browser-process**
+intermediary that enforces policies and appropriate gating
+before invoking the platform haptics backend.
 
 Data flow for a single call:
 
@@ -69,23 +72,32 @@ Web page (JS)
         │
         ▼
 Blink renderer  (third_party/blink/renderer/modules/haptics/)
-  HapticsController::PlayHaptics
+  HapticsController::PlayHaptics   
     • fenced-frame check
     • "haptics" permissions policy check
-    • sticky user-activation check
+    • user-activation check
     • clamp intensity to [0,1]
 
-        │  device.mojom.HapticsManager::PlayHaptics(effect, intensity)
+        │  blink.mojom.HapticsService::PlayHaptics(effect, intensity)
         ▼  (Mojo IPC)
-        
-Browser process  (content/browser/browser_interface_binders.cc)
-  #if IS_WIN → HapticsManagerImplWin   (runs on the UI thread)
-  #else      → device service → HapticsManagerImpl (no-op base)
+
+Browser process  (content/browser/haptics/)
+  content::HapticsService   (authoritative re-checks; DocumentService)
+    • fenced-frame re-check
+    • "haptics" permissions policy re-check
+    • user-activation re-check
+    • re-clamp intensity
+        │  in-process C++ call (no device-service hop on Windows)
+        ▼
+  HapticsManagerImplWin   (runs on the UI thread)
         │
         ▼
 Windows.Devices.Haptics.InputHapticsManager (WinRT API)
   → most-recent input device's SimpleHapticsController → hardware vibration
 ```
+
+*A device-service backend (a second, browser↔utility-process pipe) is **not**
+built for the Windows milestone; see [D5](#d5-device-service-backend-non-windows-platforms).*
 
 ### D1. JS surface: IDL, effect enum, runtime flag
 
@@ -100,20 +112,22 @@ enum HapticEffect { "hint", "edge", "tick", "align" };
 
 [
     ImplementedAs=HapticsController,
-    RuntimeEnabled=WebHaptics
+    RuntimeEnabled=WebHaptics,
+    MeasureAs=NavigatorPlayHaptics
 ] partial interface Navigator {
     undefined playHaptics(HapticEffect effect, optional double intensity = 1);
 };
 ```
 
 Because `playHaptics()` returns `undefined` and exposes no success signal, web
-  content cannot observe whether a device actually played — this is deliberate
-  (see [Privacy](#privacy-considerations)).
+  content cannot observe whether a device actually played (see [Privacy](#privacy-considerations)).
 
 ### D2. Blink renderer: `HapticsController`
 
-`HapticsController` is a `Supplement<Navigator>` that enforces the API's gating
-rules and forwards to the browser over Mojo.
+`HapticsController` is a `Supplement<Navigator>` that applies the API's gating
+rules and forwards to the browser over Mojo. These renderer-side checks are a
+fast path only, not the security boundary: `content::HapticsService` re-checks
+them in the browser ([D4](#d4-process-routing-and-the-contenthapticsservice-intermediary)).
 
 `third_party/blink/renderer/modules/haptics/haptics_controller.cc`:
 
@@ -122,7 +136,6 @@ void HapticsController::PlayHaptics(const V8HapticEffect& effect,
                                     double intensity) {
   LocalDOMWindow* window = GetSupplementable()->DomWindow();
   if (!window) return;
-  UseCounter::Count(window, WebFeature::kNavigatorPlayHaptics);
 
   LocalFrame* frame = window->GetFrame();
   if (!frame) return;
@@ -142,122 +155,169 @@ void HapticsController::PlayHaptics(const V8HapticEffect& effect,
   // Normalize intensity defensively (the IDL default is 1.0).
   intensity = std::clamp(intensity, 0.0, 1.0);
 
-  if (!haptics_manager_.is_bound()) {
+  if (!haptics_service_.is_bound()) {
     window->GetBrowserInterfaceBroker().GetInterface(
-        haptics_manager_.BindNewPipeAndPassReceiver(
+        haptics_service_.BindNewPipeAndPassReceiver(
             window->GetTaskRunner(TaskType::kMiscPlatformAPI)));
   }
-  haptics_manager_->PlayHaptics(ToMojoEffect(effect), intensity,
-                                base::DoNothing());
+  // One-way mojo call to content::HapticsService; no reply callback.
+  haptics_service_->PlayHaptics(ToMojoEffect(effect), intensity);
 }
 ```
 
 * **Gating order**: fenced-frame → permissions policy → sticky activation.
-Every early-return silently ignores the call, avoiding a fingerprinting vector.
-* **Lazy remote**: the `HeapMojoRemote<HapticsManager>` is bound on first use and
-  reset in `ContextDestroyed()`.
+Every early-return silently ignores the call.
+* **Use counter**: usage is metered declaratively by `[MeasureAs=NavigatorPlayHaptics]`
+  on the IDL operation ([D1](#d1-js-surface-idl-effect-enum-runtime-flag)), which the generated binding records before this
+  method runs.
+* **Lazy remote**: the `HeapMojoRemote<blink::mojom::HapticsService>` is bound on
+  first use and reset in `ContextDestroyed()`.
 * **Enum translation**: `ToMojoEffect()` converts the V8 enum to the mojo enum
   1:1 (`kHint`/`kEdge`/`kTick`/`kAlign`).
 
-### D3. Mojo interface: `device.mojom.HapticsManager`
+### D3. Mojo interface: `blink.mojom.HapticsService`
 
-`services/device/public/mojom/haptics_manager.mojom`:
+The renderer-facing interface lives in `third_party/blink/public/mojom/haptics/` (because for the Windows milestone the only Mojo pipe is
+renderer ↔ browser). `content::HapticsService` is the browser-side receiver.
+
+`third_party/blink/public/mojom/haptics/haptics.mojom`:
 
 ```mojom
-module device.mojom;
+module blink.mojom;
 
 enum HapticEffect { kHint, kEdge, kTick, kAlign };
 
-interface HapticsManager {
+// Implemented by content::HapticsService in the browser process, which
+// re-checks policy before invoking the platform backend.
+interface HapticsService {
   // Plays |effect| at |intensity| (normalized [0.0, 1.0]) on the most recent
-  // input device. No success signal is exposed to avoid fingerprinting.
-  PlayHaptics(HapticEffect effect, double intensity) => ();
+  // input device. Fire-and-forget: no reply is sent, and no success signal is
+  // exposed, to avoid fingerprinting.
+  PlayHaptics(HapticEffect effect, double intensity);
 };
 ```
 
-The empty `=> ()` reply is intentional to let the renderer know the request was
-processed without leaking whether hardware actually played.
+A single `HapticEffect`/`PlayHaptics` shape is reused end-to-end. A separate
+device-service mojom is not defined pre-emptively ([D5](#d5-device-service-backend-non-windows-platforms)).
 
-### D4. Process routing: browser interface binder
+`PlayHaptics` is a **one-way** method. The API returns nothing
+to JS and the renderer never inspects a response.
 
-The interface is added to the per-frame binder map. Windows routes to the
-browser-process backend; every other platform defers to the device service.
+### D4. Process routing and the `content::HapticsService` intermediary
+
+The renderer never reaches the platform backend directly. The per-frame binder
+maps `blink.mojom.HapticsService` to `content::HapticsService`, a browser-process
+object that owns the security boundary. It is a
+[`DocumentService`](https://source.chromium.org/chromium/chromium/src/+/main:content/public/browser/document_service.h),
+so its lifetime is tied to the document and the pipe, and it exposes
+`render_frame_host()` for the re-checks.
 
 `content/browser/browser_interface_binders.cc`:
 
 ```cpp
-map->Add<device::mojom::HapticsManager>(
+map->Add<blink::mojom::HapticsService>(base::BindRepeating(
     [](RenderFrameHost* host,
-       mojo::PendingReceiver<device::mojom::HapticsManager> receiver) {
-#if BUILDFLAG(IS_WIN)
-      HapticsManagerImplWin::Create(std::move(receiver));
-#else
-      GetDeviceService().BindHapticsManager(std::move(receiver));
-#endif
-    });
+       mojo::PendingReceiver<blink::mojom::HapticsService> receiver) {
+      HapticsServiceImpl::Create(host, std::move(receiver));
+    }));
 ```
 
-**Why the browser UI thread on Windows.** `InputHapticsManager::GetForCurrentThread`
-returns the haptics manager for the input queue of the *current* thread that owns
-the top-level `HWND` receiving pointer input. In Chromium that is the browser
-**UI thread**. Running the backend in the device service utility
-process (a different thread/queue) would not see the user's input device. Hence
-the Windows backend lives in `content/browser/haptics/` and is created directly
-on the UI thread, bypassing the device service.
-
-### D5. Device-service default backend (no-op base)
-
-Non-Windows platforms bind the cross-platform base. It is also the class a future
-native backend (mac/Android/etc.) would subclass by overriding
-`PlatformPlayHaptics`.
-
-`services/device/haptics/haptics_manager_impl.{h,cc}`:
+`content/browser/haptics/haptics_service_impl.cc`:
 
 ```cpp
-class HapticsManagerImpl : public mojom::HapticsManager {
- public:
-  static void Create(mojo::PendingReceiver<mojom::HapticsManager> receiver);
-  void PlayHaptics(mojom::HapticEffect effect, double intensity,
-                   PlayHapticsCallback callback) override;
- protected:
-  // Default does nothing; platform subclasses override.
-  virtual void PlatformPlayHaptics(mojom::HapticEffect effect,
-                                   double intensity);
-};
+// static
+void HapticsServiceImpl::Create(
+    RenderFrameHost* rfh,
+    mojo::PendingReceiver<blink::mojom::HapticsService> receiver) {
+  // DocumentService owns itself; deleted when the document or pipe goes away.
+  new HapticsServiceImpl(*rfh, std::move(receiver));
+}
 
-void HapticsManagerImpl::PlayHaptics(mojom::HapticEffect effect,
-                                     double intensity,
-                                     PlayHapticsCallback callback) {
-  intensity = std::clamp(intensity, 0.0, 1.0);  // defense in depth
-  PlatformPlayHaptics(effect, intensity);
-  last_effect_for_testing_ = effect;
-  last_intensity_for_testing_ = intensity;
-  std::move(callback).Run();
+void HapticsServiceImpl::PlayHaptics(blink::mojom::HapticEffect effect,
+                                     double intensity) {
+  //Re-verify every gate from the untrusted renderer.
+  if (render_frame_host().IsNestedWithinFencedFrame()) return;
+  if (!render_frame_host().IsFeatureEnabled(
+          network::mojom::PermissionsPolicyFeature::kHaptics)) {
+    return;
+  }
+  if (!render_frame_host().HasStickyUserActivation()) return;
+
+  // Reject non-finite values: std::clamp() passes NaN through unchanged.
+  if (!std::isfinite(intensity)) return;
+  intensity = std::clamp(intensity, 0.0, 1.0);
+
+#if BUILDFLAG(IS_WIN)
+  // In-process capability call; no device-service hop needed on Windows.
+  GetOrCreateHapticsManagerWin().PlayHaptics(effect, intensity);
+#endif
 }
 ```
+
+**Why re-check in the browser.** The renderer's checks ([D2](#d2-blink-renderer-hapticscontroller)) run in a process the
+page could compromise. `content::HapticsService` re-derives fenced-frame status, permissions
+policy, and user activation from browser-side state (`RenderFrameHost`), which the
+page cannot forge. Only after those pass does it make requests to the hardware.
+
+**Why an in-process call on Windows.** `InputHapticsManager::GetForCurrentThread`
+returns the haptics manager for the input queue of the *current* thread that owns
+the top-level `HWND` receiving pointer input, which in Chromium is the browser
+**UI thread**. Because `content::HapticsService` and the Windows backend both live
+in the browser process, the intermediary reaches the backend with a direct C++ call;
+there is no second Mojo pipe to a utility process. A browser↔device-service pipe
+would only be introduced for a backend that must live in the device service (a
+future non-Windows platform; see [D5](#d5-device-service-backend-non-windows-platforms)).
+
+### D5. Device-service backend (non-Windows platforms)
+
+**Not built for the Windows milestone.** The Windows backend runs in the browser
+process ([D4](#d4-process-routing-and-the-contenthapticsservice-intermediary)), so
+there is no browser↔device-service pipe. A device-service `HapticsManager` and a
+cross-platform no-op base are **deferred** until a platform needs a backend hosted
+in the device service.
+
+The design will follow a two-pipe model:
+
+* `content::HapticsService` stays the browser-side security boundary and the sole
+  thing the renderer talks to.
+* After its re-checks pass, instead of an in-process call it forwards over a
+  second Mojo pipe (browser ↔ device service) to a device-service
+  `mojom::HapticsManager`. That pipe may reuse `blink.mojom.HapticsService`, or
+  a dedicated `device.mojom` interface can be added under
+  `services/device/public/mojom/`.
+* The device-service implementation is an **unguarded** capability: it
+  trusts its (browser-process) client and does no policy checks, because those
+  already happened in `content::HapticsService`. `PlayHaptics` would clamp
+  defensively and drive the platform API, exactly as `HapticsManagerImplWin` does
+  today.
+
+See [Followup work](#followup-work).
 
 ### D6. Windows backend: `HapticsManagerImplWin`
 
 `content/browser/haptics/haptics_manager_impl_win.{h,cc}` is the real
 implementation, using the `Windows.Devices.Haptics.InputHapticsManager` API.
 
-#### D6.1 Threading model and receiver ownership
+#### D6.1 Threading model and ownership
 
-The receiver is bound and dispatched on the UI thread. The instance is
-self-owned (its lifetime is tied to the Mojo pipe), and a `SEQUENCE_CHECKER`
+`HapticsManagerImplWin` is a plain browser-process object, **not** a Mojo
+receiver. `content::HapticsService` ([D4](#d4-process-routing-and-the-contenthapticsservice-intermediary))
+owns one lazily and calls it in-process on the UI thread. A `SEQUENCE_CHECKER`
 guards every method:
 
 ```cpp
-// static
-void HapticsManagerImplWin::Create(
-    mojo::PendingReceiver<device::mojom::HapticsManager> receiver) {
+// Owned by content::HapticsService; created lazily on first PlayHaptics.
+HapticsManagerImplWin& HapticsServiceImpl::GetOrCreateHapticsManagerWin() {
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
-  mojo::MakeSelfOwnedReceiver(std::make_unique<HapticsManagerImplWin>(),
-                              std::move(receiver));
+  if (!win_backend_)
+    win_backend_ = std::make_unique<HapticsManagerImplWin>();
+  return *win_backend_;
 }
 ```
 
-All WinRT calls happen on the one thread that owns the input queue.
+All WinRT calls happen on the one thread that owns the input queue (the UI
+thread), and the backend's lifetime is bounded by its owning
+`content::HapticsService`, hence by the document.
 
 #### D6.2 Statics resolution (`EnsureStatics`)
 
@@ -394,15 +454,14 @@ auto is_supported = [&](uint16_t w) {
 };
 
 // 1) Preferred: the correct Windows waveform for this effect (Hover/Collide/
-//    Step/Align). May be null on a pre-19.0 OS where Collide/Step/Align are
-//    unavailable (see D6.5).
+//    Step/Align).
 std::optional<uint16_t> preferred = WaveformForEffect(effect);
 
 // 2) Device-type default: Mouse/Touchpad -> Hover, Pen -> Click.
 std::optional<uint16_t> device_default = DefaultWaveformForDevice(device_type);
 
-// Nothing resolved at all -> drop (callback still runs).
-if (!preferred && !device_default) { std::move(callback).Run(); return; }
+// Nothing resolved at all -> nothing to send, return.
+if (!preferred && !device_default) return;
 
 // Primary = semantic if the device advertises it, else the device-type default.
 uint16_t target = (preferred && is_supported(*preferred))
@@ -417,16 +476,10 @@ boolean sent = false;
 manager->TrySendHapticWaveformWithIntensity(target, fallback, intensity, &sent);
 ```
 
-So there are two platform-aligned tiers:
-1. **Semantic**: the correct Windows waveform for the effect, when the device
-   supports it.
-2. **Device-type default**: Mouse/Touchpad → Hover, Pen → Click, passed as the
-   `TrySend` fallback so the OS substitutes it automatically when the semantic
-   waveform is unsupported.
-
-If the device supports neither the semantic waveform nor its device-type default,
-`TrySend` reports `sent == false` and the effect is dropped (the callback still
-runs).
+So there are two platform-aligned tiers: the **semantic** waveform when the device
+supports it, otherwise the **device-type default** passed as the `TrySend` fallback.
+If the device supports neither, `TrySend` reports `sent == false` and the effect is
+silently dropped.
 
 #### D6.5 Semantic mapping table and the SDK interface gap
 
@@ -468,10 +521,10 @@ the locally-declared `Statics3` for the rest:
 
 ```cpp
 std::optional<uint16_t> HapticsManagerImplWin::WaveformForEffect(
-    device::mojom::HapticEffect effect) {
+    blink::mojom::HapticEffect effect) {
   UINT16 value = 0;
 
-  if (effect == device::mojom::HapticEffect::kHint) {           // Hover
+  if (effect == blink::mojom::HapticEffect::kHint) {           // Hover
     if (!known_waveforms2_) return std::nullopt;
     return SUCCEEDED(known_waveforms2_->get_Hover(&value))
                ? std::optional<uint16_t>(value) : std::nullopt;
@@ -486,17 +539,17 @@ std::optional<uint16_t> HapticsManagerImplWin::WaveformForEffect(
 
   HRESULT hr = E_FAIL;
   switch (effect) {
-    case device::mojom::HapticEffect::kEdge:  hr = waveforms3->get_Collide(&value); break;
-    case device::mojom::HapticEffect::kTick:  hr = waveforms3->get_Step(&value);    break;
-    case device::mojom::HapticEffect::kAlign: hr = waveforms3->get_Align(&value);   break;
-    case device::mojom::HapticEffect::kHint:  NOTREACHED();  // handled above
+    case blink::mojom::HapticEffect::kEdge:  hr = waveforms3->get_Collide(&value); break;
+    case blink::mojom::HapticEffect::kTick:  hr = waveforms3->get_Step(&value);    break;
+    case blink::mojom::HapticEffect::kAlign: hr = waveforms3->get_Align(&value);   break;
+    case blink::mojom::HapticEffect::kHint:  NOTREACHED();  // handled above
   }
   return SUCCEEDED(hr) ? std::optional<uint16_t>(value) : std::nullopt;
 }
 ```
 
 On a pre-19.0 OS the `QueryInterface` fails and the effect degrades to the
-device-type default fallback ([D6.4](#d64-per-device-waveform-detection-semantic-mapping-and-fallback)). When Chromium's bundled SDK advances to
+device-type default fallback ([D6.4](#d64-waveform-detection-semantic-mapping-and-fallback)). When Chromium's bundled SDK advances to
 contract 19.0, the local declaration can be deleted and replaced with the SDK
 interface with no behavior change.
 
@@ -507,7 +560,7 @@ Windows 11 builds, so `hint` gets its true semantic waveform broadly.
 with Windows 11 **24H2** (Oct 2024), so `edge`/`tick`/`align` get their true
 semantic waveform only on 24H2-or-newer machines; on older Windows 11 builds
 (21H2/22H2/23H2) and on Windows 10 they degrade to the device-type default
-fallback ([D6.4](#d64-per-device-waveform-detection-semantic-mapping-and-fallback)). This is why `Statics3` is best-effort and runtime-probed rather than
+fallback ([D6.4](#d64-waveform-detection-semantic-mapping-and-fallback)). This is why `Statics3` is best-effort and runtime-probed rather than
 assumed from the OS family.
 
 > The `kHint: NOTREACHED()` case exists only because Chromium switches over mojo
@@ -524,14 +577,14 @@ The Windows backend gets this behavior directly from the platform:
 `InputHapticsManager::GetForCurrentThread` plus `get_CurrentHapticsController`
 returns the controller for the **most recent** input device on the thread's
 input queue. The backend therefore does **not** enumerate devices or pick among
-them — it always operates on `CurrentHapticsController`:
+them; it always operates on `CurrentHapticsController`:
 
 * If the most-recent device has no haptics controller,
   `GetSupportedWaveforms` returns empty → the effect is dropped (no reroute).
 * If the user switches devices (e.g. from a haptic mouse to a plain one), the
   next call naturally sees the new `CurrentHapticsController`.
 
-Not enumerating devices is also a **privacy** property: it avoids exposing how
+Not enumerating devices is also a **privacy** property, it avoids exposing how
 many haptic devices exist or which one is active.
 
 ### D7. Feature gating and registration
@@ -546,7 +599,7 @@ many haptic devices exist or which one is active.
 The `"self"` default allowlist means same-origin iframes inherit access, while
 cross-origin iframes must be explicitly delegated with `allow="haptics"`.
 
-## Part B — Declarative API: CSS `@haptic` at-rule
+## Declarative API: CSS `@haptic` at-rule
 
 > **Design TBD.**
 
@@ -605,15 +658,17 @@ tuning.
 
 ## **Security**
 
-* **Compromised-renderer assumption.** The browser trusts nothing from the
-  renderer: intensity is re-clamped in the browser/device-service backend, and
-  the effect enum is a closed mojo enum. A malicious renderer can at worst
-  request a valid effect at a valid intensity on the current input device — the
-  same thing a legitimate page can do.
-* **Gating** (fenced-frame suppression, `"haptics"` permissions policy, sticky
-  user activation) is enforced in the renderer; the effect is transient and the
-  user can end it by navigating away, so the abuse ceiling is low. Anti-abuse
-  tools (throttling, origin suppression) remain available as follow-ups.
+* **Compromised-renderer assumption.** All gating (fenced-frame, `"haptics"`
+  permissions policy, user activation) and intensity clamping are re-enforced in
+  the browser by `content::HapticsService` ([D4](#d4-process-routing-and-the-contenthapticsservice-intermediary));
+  the renderer's own checks are only a fast path. The effect is a closed mojo enum,
+  so a malicious renderer can at worst request a valid effect at a valid intensity
+  on the current input device, the same thing a legitimate page can do.
+* **No direct hardware path.** The renderer holds only a `blink.mojom.HapticsService`
+  pipe to the browser intermediary; the platform WinRT API is touched exclusively
+  by browser-process code that ran those checks.
+* **Low abuse ceiling.** The effect is transient and ends when the user navigates
+  away; throttling and origin suppression remain available as follow-ups.
 * **Locally-declared WinRT interface** ([D6.5](#d65-semantic-mapping-table-and-the-sdk-interface-gap)): the hand-written vtable must match
   the SDK exactly. It is only ever obtained via `QueryInterface` (which validates
   the IID) and used to read `UINT16` waveform ids, so no untrusted data crosses
@@ -640,10 +695,13 @@ template; this API's posture is "add no new observable device signal."
 
 # **Testing plan**
 
-* **Unit test** (`services/device/haptics/haptics_manager_impl_unittest.cc`):
-  binds the device-service `HapticsManager` and asserts the effect/intensity are
-  received and that intensity is clamped to `[0,1]` — via the static
-  `last_*_for_testing_` hooks, no hardware needed.
+* **Browser re-check test** (`content/browser/haptics/haptics_service_impl_unittest.cc`
+  or a `content_browsertest`): drives `content::HapticsService::PlayHaptics`
+  through a fake `RenderFrameHost` and asserts the browser **re-enforces** each
+  gate (fenced frame, `"haptics"` permissions policy, and user activation) and
+  re-clamps intensity to `[0,1]`, independent of what the renderer claimed. The
+  one-way call is observed via `remote.FlushForTesting()` and a fake backend that
+  records the last effect/intensity; no hardware needed.
 * **Web tests** (follow-up): verify the JS surface exists only when `WebHaptics`
   is enabled, that gating (permissions policy, sticky activation, fenced frames)
   silently no-ops, and that the call returns `undefined`.
@@ -653,8 +711,14 @@ template; this API's posture is "add no new observable device signal."
 
 # **Followup work**
 
-* **Declarative CSS `@haptic` API ([Part B](#part-b--declarative-api-css-haptic-at-rule))** — design and implement.
-* **Additional native backends** — Linux/macOS/iOS/Android by subclassing
-  `HapticsManagerImpl::PlatformPlayHaptics`.
+* **Declarative CSS `@haptic` API ([Declarative API: CSS `@haptic` at-rule](#declarative-api-css-haptic-at-rule))**: design and implement.
+* **Device-service backend + second Mojo pipe ([D5](#d5-device-service-backend-non-windows-platforms))**:
+  add a device-service `mojom::HapticsManager` and the browser↔device-service pipe
+  from `content::HapticsService`, needed for any backend that must run in the
+  device service rather than the browser process.
+* **Additional native backends**: Linux/macOS/iOS/Android, each hosted where its
+  threading requires: in the browser process behind `content::HapticsService`
+  (like `HapticsManagerImplWin`) or in the device service behind the deferred pipe
+  above.
 * **Remove the local `Statics3` declaration** once Chromium's bundled Windows SDK
   reaches UniversalApiContract 19.0.
