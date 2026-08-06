@@ -300,7 +300,7 @@ implementation, using the `Windows.Devices.Haptics.InputHapticsManager` API.
 
 #### D6.1 Threading model and ownership
 
-`HapticsManagerImplWin` is a plain browser-process object, **not** a Mojo
+`HapticsManagerImplWin` is a plain browser-process object, not a Mojo
 receiver. `content::HapticsService` ([D4](#d4-process-routing-and-the-contenthapticsservice-intermediary))
 owns one lazily and calls it in-process on the UI thread. A `SEQUENCE_CHECKER`
 guards every method:
@@ -337,6 +337,10 @@ hr = base::win::GetActivationFactory<
     &known_waveforms2_);
 // Failure here is non-fatal; PlayHaptics falls back to a device waveform.
 ```
+
+`InputHapticsManager` requires UniversalApiContract 19.0 (Windows 11 24H2+), so
+this is where the OS floor is enforced: on earlier builds the class does not
+exist, `EnsureStatics()` fails, and `PlayHaptics` is a clean no-op.
 
 #### D6.3 Controller priming
 
@@ -493,18 +497,17 @@ Per the explainer, the four effects map to these
 | `tick`  | **Step**    | `IKnownSimpleHapticsControllerWaveformsStatics3` |
 | `align` | **Align**   | `IKnownSimpleHapticsControllerWaveformsStatics3` |
 
-**The SDK gap.** These named waveforms live on *versioned* interfaces of the same
-runtime class, gated by `WINDOWS_FOUNDATION_UNIVERSALAPICONTRACT_VERSION`:
-
-* `...Statics2` (Hover) requires contract **14.0**, **present** in the Windows
-  SDK bundled with the Chromium toolchain.
-* `...Statics3` (Collide/Align/Step) requires contract **19.0**, **absent** from
-  the bundled toolchain SDK.
+**The build-time SDK gap.** The Windows SDK bundled with the
+Chromium toolchain ships the header for `...Statics2`
+(Hover, contract 14.0) but not for `...Statics3` (Collide/Align/Step, contract
+19.0), while the code must still compile against that SDK.
 
 **Fix:** Declare `IKnownSimpleHapticsControllerWaveformsStatics3` locally
 in the `.cc`, replicating the SDK's IID and vtable layout exactly, and obtain it
 at runtime via `QueryInterface` from the same activation-factory object. Hover
-continues to use the SDK-provided `Statics2`.
+uses the SDK-provided `Statics2`. The local declaration is a header workaround
+only: at runtime, on any 24H2+ machine where the manager resolves, `Statics3` is
+present too.
 
 ```cpp
 MIDL_INTERFACE("ae480ce4-4ab6-5b2f-ad0b-cb52f37d45fb")
@@ -548,20 +551,18 @@ std::optional<uint16_t> HapticsManagerImplWin::WaveformForEffect(
 }
 ```
 
-On a pre-19.0 OS the `QueryInterface` fails and the effect degrades to the
-device-type default fallback ([D6.4](#d64-waveform-detection-semantic-mapping-and-fallback)). When Chromium's bundled SDK advances to
-contract 19.0, the local declaration can be deleted and replaced with the SDK
-interface with no behavior change.
+The `Statics3` QueryInterface runs only on 24H2+, the feature's floor, so it
+succeeds whenever the manager itself resolved and all four effects get their true
+semantic waveform. The QI failure path is defensive: should it ever fail, the
+effect degrades to the device-type default fallback ([D6.4](#d64-waveform-detection-semantic-mapping-and-fallback)).
+When Chromium's bundled SDK advances to contract 19.0, the local declaration can be
+replaced with the SDK interface with no behavior change.
 
-These contract levels map to specific OS builds.
-`Statics2` (Hover, contract 14.0) is present on essentially all supported
-Windows 11 builds, so `hint` gets its true semantic waveform broadly.
-`Statics3` (Collide/Step/Align, contract 19.0) only arrived
-with Windows 11 **24H2** (Oct 2024), so `edge`/`tick`/`align` get their true
-semantic waveform only on 24H2-or-newer machines; on older Windows 11 builds
-(21H2/22H2/23H2) and on Windows 10 they degrade to the device-type default
-fallback ([D6.4](#d64-waveform-detection-semantic-mapping-and-fallback)). This is why `Statics3` is best-effort and runtime-probed rather than
-assumed from the OS family.
+The device-type default fallback ([D6.4](#d64-waveform-detection-semantic-mapping-and-fallback))
+fires on *device capability*, not OS version: on a supported machine a given input
+device may simply not advertise a semantic waveform, and the OS substitutes the
+device-type default. On systems below the 24H2 floor the backend no-ops entirely
+([D6.2](#d62-statics-resolution-ensurestatics)).
 
 > The `kHint: NOTREACHED()` case exists only because Chromium switches over mojo
 > enums are exhaustive (no `default:`, `-Wswitch` enforced), so every enumerator
