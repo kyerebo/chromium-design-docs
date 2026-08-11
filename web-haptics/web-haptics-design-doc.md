@@ -84,6 +84,7 @@ Blink renderer  (third_party/blink/renderer/modules/haptics/)
 Browser process  (content/browser/haptics/)
   content::HapticsService   (authoritative re-checks; DocumentService)
     • fenced-frame re-check
+    • active-document re-check
     • "haptics" permissions policy re-check
     • user-activation re-check
     • re-clamp intensity
@@ -237,6 +238,10 @@ void HapticsServiceImpl::PlayHaptics(blink::mojom::HapticEffect effect,
                                      double intensity) {
   //Re-verify every gate from the untrusted renderer.
   if (render_frame_host().IsNestedWithinFencedFrame()) return;
+  // Drop calls from a document that is no longer active (for example one in
+  // the back/forward cache or pending deletion): its pipe stays live and its
+  // sticky activation still passes, so this is checked explicitly.
+  if (!render_frame_host().IsActive()) return;
   if (!render_frame_host().IsFeatureEnabled(
           network::mojom::PermissionsPolicyFeature::kHaptics)) {
     return;
@@ -255,9 +260,11 @@ void HapticsServiceImpl::PlayHaptics(blink::mojom::HapticEffect effect,
 ```
 
 **Why re-check in the browser.** The renderer's checks ([D2](#d2-blink-renderer-hapticscontroller)) run in a process the
-page could compromise. `content::HapticsService` re-derives fenced-frame status, permissions
-policy, and user activation from browser-side state (`RenderFrameHost`), which the
-page cannot forge. Only after those pass does it make requests to the hardware.
+page could compromise. `content::HapticsService` re-derives fenced-frame status, active-document
+state, permissions policy, and user activation from browser-side state (`RenderFrameHost`), which the
+page cannot forge. The active-document check matters because a `DocumentService` pipe outlives a
+navigation while the document sits in the back/forward cache, so a queued call could otherwise run
+for a page the user has left. Only after those pass does it make requests to the hardware.
 
 **Why an in-process call on Windows.** `InputHapticsManager::GetForCurrentThread`
 returns the haptics manager for the input queue of the *current* thread that owns
@@ -659,8 +666,8 @@ tuning.
 
 ## **Security**
 
-* **Compromised-renderer assumption.** All gating (fenced-frame, `"haptics"`
-  permissions policy, user activation) and intensity clamping are re-enforced in
+* **Compromised-renderer assumption.** All gating (fenced-frame, active document,
+  `"haptics"` permissions policy, user activation) and intensity clamping are re-enforced in
   the browser by `content::HapticsService` ([D4](#d4-process-routing-and-the-contenthapticsservice-intermediary));
   the renderer's own checks are only a fast path. The effect is a closed mojo enum,
   so a malicious renderer can at worst request a valid effect at a valid intensity
@@ -699,7 +706,7 @@ template; this API's posture is "add no new observable device signal."
 * **Browser re-check test** (`content/browser/haptics/haptics_service_impl_unittest.cc`
   or a `content_browsertest`): drives `content::HapticsService::PlayHaptics`
   through a fake `RenderFrameHost` and asserts the browser **re-enforces** each
-  gate (fenced frame, `"haptics"` permissions policy, and user activation) and
+  gate (fenced frame, active document, `"haptics"` permissions policy, and user activation) and
   re-clamps intensity to `[0,1]`, independent of what the renderer claimed. The
   one-way call is observed via `remote.FlushForTesting()` and a fake backend that
   records the last effect/intensity; no hardware needed.
